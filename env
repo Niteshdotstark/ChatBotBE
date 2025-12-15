@@ -1,0 +1,7 @@
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=postgres
+DB_PASSWORD=123
+SECRET_KEY=ABCDEFGHI123
+DATABASE_URI=postgresql://postgres:123@localhost:5432/multi_tenant_admin
+

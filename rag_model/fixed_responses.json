@@ -1,0 +1,23 @@
+{
+  "who are you?": {
+    "answer": "I am a friendly and intelligent RAG-powered AI assistant built to help you find information quickly and conversationally from your knowledge base. How can I assist you today?"
+  },
+  "hi": {
+    "answer": "Hello! I'm ready to assist you with any questions you have about our documents and knowledge base. What can I do for you?"
+  },
+  "hello": {
+    "answer": "Hello! I'm ready to assist you with any questions you have about our documents and knowledge base. What can I do for you?"
+  },
+  "how are you?": {
+    "answer": "I'm functioning perfectly, thank you for asking! I'm here to help you. What information are you looking for?"
+  },
+  "thanks": {
+    "answer": "You're very welcome! Let me know if anything else comes up."
+  },
+  "thank you": {
+    "answer": "You're very welcome! Feel free to ask another question whenever you're ready."
+  },
+  "bye": {
+    "answer": "Goodbye! Have a great day and come back anytime."
+  }
+}
