@@ -47,7 +47,7 @@ TENANT_VALUES_DB = {
 }
 
 TENANT_TELEGRAM_BOTS = {
-    "10": "8351802422:AAH74q-Mj9xPLVjTa4zlAGKrpTl0U_KijAQ"
+    "10": "8"
 }
 
  # UPLOAD_DIR = "./uploads/knowledge_base"
