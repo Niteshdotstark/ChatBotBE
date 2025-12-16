@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field, validator
 from typing import Optional, List
 from datetime import datetime
 from fastapi import UploadFile
+import re
 
 class UserBase(BaseModel):
     email: str = Field(..., description="User email") # Use EmailStr for email validation
