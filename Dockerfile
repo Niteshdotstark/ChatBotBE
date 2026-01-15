@@ -50,4 +50,4 @@ RUN mkdir -p /app/uploads && chmod -R 777 /app/uploads
 EXPOSE 8000
 
 # Run with uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--limit-max-request-size", "10485760"]

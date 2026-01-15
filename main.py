@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, Form, Request, Response, BackgroundTasks
 from urllib.parse import unquote
 import httpx
+import boto3
+from botocore.exceptions import ClientError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from database import get_db, engine, Base
@@ -21,7 +23,7 @@ import re
 from uuid import UUID
 import glob
 import os, uuid, boto3, shutil
-from rag_model.chat_data_utils import HISTORY_DIR
+from rag_model.chat_data_utils import HISTORY_DIR, append_conversation_message, get_recent_conversation_context
 app = FastAPI()
 
 app.add_middleware(
@@ -119,12 +121,24 @@ async def create_user(user: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/login/", response_model=TokenResponse)
 async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == form_data.username).first() # form_data.username is the email
-    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+    print(f"DEBUG: Login attempt for username: {form_data.username}")
+    email_to_search = form_data.username.lower().strip()
+    user = db.query(User).filter(User.email == email_to_search).first() # form_data.username is the email
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+    try:
+        # This is where the crash was happening
+        if not pwd_context.verify(form_data.password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Incorrect email or password")
+    except Exception as e:
+        # This catches the UnknownHashError and prevents a 500 error
+        print(f"CRITICAL: Password verification failed for {user.email}")
+        print(f"REASON: {str(e)}")
+        print(f"DATABASE HASH WAS: {user.hashed_password}")
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=401, 
+            detail="Your account security format is outdated. Please register again or reset your password."
         )
 
     tenant = db.query(Tenant).filter(Tenant.creator_id == user.id).first()
@@ -302,17 +316,49 @@ async def get_latest_analysis_report_data(
     """
     Retrieves the data from the latest Top Questions Analysis Report 
     for a given tenant as a structured JSON list (PUBLIC ENDPOINT).
+    Reads from S3 first, falls back to local filesystem.
     """
-    # NOTE: Authorization checks (current_user and tenant ownership) have been 
-    # removed to make this endpoint public for testing purposes, as requested.
+    # S3 Configuration
+    S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "rag-chat-uploads")
+    S3_REGION_NAME = os.getenv("AWS_DEFAULT_REGION", "ap-south-1")
+    S3_CONVERSATION_PREFIX = "conversation_history"
     
-    # 2. Determine the path to the report files
-    # Assuming HISTORY_DIR is available/imported globally or from chat_data_utils
+    try:
+        s3_client = boto3.client("s3", region_name=S3_REGION_NAME)
+        
+        # Try to find the latest report in S3
+        try:
+            prefix = f"{S3_CONVERSATION_PREFIX}/{tenant_id}/top_questions_for_review_"
+            paginator = s3_client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=S3_BUCKET_NAME, Prefix=prefix)
+            
+            report_keys = []
+            for page in pages:
+                for obj in page.get('Contents', []):
+                    if obj['Key'].endswith('.json'):
+                        report_keys.append(obj['Key'])
+            
+            if report_keys:
+                # Get the latest one by modified time
+                latest_key = max(report_keys, key=lambda k: s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=k)['LastModified'])
+                
+                response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=latest_key)
+                report_data = json.loads(response['Body'].read().decode('utf-8'))
+                print(f"Loaded report data from S3: {latest_key}")
+                return report_data
+        except ClientError:
+            pass  # Fall through to local filesystem
+        except Exception as e:
+            print(f"⚠️ Error reading from S3: {e}")
+    
+    except Exception:
+        pass
+    
+    # Fallback to local filesystem
     from chat_data_utils import HISTORY_DIR 
     tenant_history_dir = os.path.join(HISTORY_DIR, str(tenant_id))
 
-    # 3. Find the latest report file
-    # Pattern to match: top_questions_for_review_tenant_{tenant_id}_*_YYYY-MM-DD.json
+    # Find the latest report file
     file_pattern = os.path.join(tenant_history_dir, f"top_questions_for_review_tenant_{tenant_id}_*_*.json")
     all_reports = glob.glob(file_pattern)
 
@@ -322,18 +368,17 @@ async def get_latest_analysis_report_data(
     # Find the latest file (based on last modified time)
     latest_report_path = max(all_reports, key=os.path.getmtime)
     
-    # 4. Read the file content
+    # Read the file content
     try:
         with open(latest_report_path, 'r', encoding='utf-8') as f:
             report_data = json.load(f)
-            print(f"Loaded report data from: {latest_report_path}")
+            print(f"Loaded report data from local filesystem: {latest_report_path}")
             
-            # 5. Return the structured data (FastAPI automatically validates against TopQuestionAnalysis list)
+            # Return the structured data (FastAPI automatically validates against TopQuestionAnalysis list)
             return report_data
             
     except Exception as e:
         print(f"Error loading or parsing report file {latest_report_path}: {e}")
-        # Note: If the file exists but has invalid JSON content, this is the error we raise.
         raise HTTPException(status_code=500, detail="Failed to load analysis report data.")
 
 @app.post("/rag/ask/{tenant_id}", response_model=ChatResponse)
@@ -352,10 +397,18 @@ async def ask_rag_with_path_tenant_id(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Tenant ID {tenant_id} not found.")
 
     try:
-        response_data = answer_question_modern(request.message, tenant_id, 1)
-        
+        user_key = "api_anonymous"
+        append_conversation_message(tenant_id, user_key, 'human', request.message)
+        context_msgs = get_recent_conversation_context(tenant_id, user_key, last_n_questions=5)
+
+        response_data = answer_question_modern(request.message, tenant_id, user_key, context_messages=context_msgs)
+        answer_text = response_data.get("answer", "No answer found.")
+
+        # Save AI reply to history
+        append_conversation_message(tenant_id, user_key, 'ai', answer_text)
+
         return ChatResponse(
-            response=response_data.get("answer", "No answer found."),
+            response=answer_text,
             sources=response_data.get("sources", [])
         )
     except Exception as e:
@@ -801,10 +854,18 @@ async def chat_with_tenant_kb(
 
     # Call your RAG model with the provided message and tenant_id
     try:
-        response_data = answer_question_modern(chat_request.message, tenant_id,1)
+        user_key = str(current_user.id)
+        append_conversation_message(tenant_id, user_key, 'human', chat_request.message)
+        context_msgs = get_recent_conversation_context(tenant_id, user_key, last_n_questions=5)
+
+        response_data = answer_question_modern(chat_request.message, tenant_id, user_key, context_messages=context_msgs)
+        answer_text = response_data.get("answer", "No answer found.")
+
+        append_conversation_message(tenant_id, user_key, 'ai', answer_text)
+
         # Ensure the response_data has 'answer' and 'sources' keys
         return ChatResponse(
-            response=response_data.get("answer", "No answer found."),
+            response=answer_text,
             sources=response_data.get("sources", [])
         )
     except Exception as e:
@@ -819,12 +880,14 @@ async def ask_chatbot(
     db: Session = Depends(get_db)
 ):
     # This returns {"answer": "...", "sources": [...]}
-    response_data = answer_question_modern(request.message, tenant_id, 1) 
+    user_key = "api_anonymous"
+    append_conversation_message(tenant_id, user_key, 'human', request.message)
+    context_msgs = get_recent_conversation_context(tenant_id, user_key, last_n_questions=5)
+
+    response_data = answer_question_modern(request.message, tenant_id, user_key, context_messages=context_msgs)
     print(f"DEBUG: Type of response_data: {type(response_data)}")
     print(f"DEBUG: Content of response_data: {response_data}")
     
-    # FIX: Return a dictionary where the 'response' key holds the string value 
-    # from response_data['answer']
     answer_value = response_data.get("answer", "No answer found.")
 
     # Check if the answer_value is a dictionary (the nested case)
@@ -834,6 +897,8 @@ async def ask_chatbot(
     else:
         # It's the RAG response: the answer_value is already the string
         final_answer_string = str(answer_value) # Ensure it's a string
+
+    append_conversation_message(tenant_id, user_key, 'ai', final_answer_string)
 
     # ----------------------------------------------------------------------
 
@@ -925,8 +990,14 @@ async def handle_webhook(tenant_id: int, request: Request, db: Session = Depends
                         continue
 
                     try:
-                        # Pass TENANT_ID to RAG model
-                        response_data = answer_question_modern(text, TENANT_ID, sender_id)
+                        # Save incoming human message
+                        append_conversation_message(TENANT_ID, str(sender_id), 'human', text)
+
+                        # Load recent context (last 5 human questions + surrounding AI replies)
+                        context_msgs = get_recent_conversation_context(TENANT_ID, str(sender_id), last_n_questions=5)
+
+                        # Pass TENANT_ID and context to RAG model
+                        response_data = answer_question_modern(text, TENANT_ID, str(sender_id), context_messages=context_msgs)
 
                         # SAFELY extract the answer string, no matter what
                         if isinstance(response_data, dict):
@@ -939,6 +1010,9 @@ async def handle_webhook(tenant_id: int, request: Request, db: Session = Depends
                         # Now 100% guaranteed to be a string
                         response_text = str(response_text).strip()
                         print(f"Final Reply Text: {response_text[:100]}...")
+
+                        # Append AI reply to history
+                        append_conversation_message(TENANT_ID, str(sender_id), 'ai', response_text)
 
                     except HTTPException as e:
                         if e.status_code == 402:
@@ -988,9 +1062,16 @@ async def telegram_webhook(
         text = data["message"].get("text", "")
 
         try:
-            response_data = answer_question_modern(text, tenant_id, chat_id)
+            # Save incoming message
+            append_conversation_message(tenant_id, str(chat_id), 'human', text)
+            context_msgs = get_recent_conversation_context(tenant_id, str(chat_id), last_n_questions=5)
+
+            response_data = answer_question_modern(text, tenant_id, str(chat_id), context_messages=context_msgs)
             response_text = response_data.get("answer", "No answer found.")
             response_text = format_response(response_text)
+
+            # Append AI reply
+            append_conversation_message(tenant_id, str(chat_id), 'ai', response_text)
         except HTTPException as e:
             if e.status_code == 402:
                 print(f"⚠️ RAG provider limit exceeded for Telegram {chat_id}")

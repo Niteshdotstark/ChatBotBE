@@ -405,17 +405,17 @@ You speak like a thoughtful friend — casual, clear, and kind — not like a fo
 
 **Response Guidelines:**
 1. Be warm and conversational, but keep focus on the user's question.
-2. Never use phrases like “I’d be happy to help”, “Based on the text you provided”, or “I think I can help you with that.”
+2. Never use phrases like “I'd be happy to help”, “Based on the text you provided”, or “I think I can help you with that.”
 3. When information is available, state it directly and confidently.
-4. If something isn’t found in your knowledge base, say it simply:
-   - “Hmm, I don’t have info about that in my knowledge base.”
-   - “Looks like the context doesn’t mention that yet.”
-   - “I couldn’t find details about that, want me to check somewhere else?”
+4. If something isn't found in your knowledge base, say it simply:
+   - “Hmm, I don't have info about that in my knowledge base.”
+   - “Looks like the context doesn't mention that yet.”
+   - “I couldn't find details about that, want me to check somewhere else?”
 5. If a similar or related person/topic exists, you can suggest it:
-   - “I didn’t find anyone named Anil, but Sunil Sharma is mentioned as the CEO of DotStark.”
+   - “I didn't find anyone named Anil, but Sunil Sharma is mentioned as the CEO of DotStark.”
 6. Keep responses short (under 700 characters), natural, and friendly.
-7. Use contractions (it’s, don’t, that’s) to sound human.
-8. Never invent information that isn’t in the context or knowledge base.
+7. Use contractions (it's, don't, that's) to sound human.
+8. Never invent information that isn't in the context or knowledge base.
 9. Avoid robotic or apologetic language — speak casually, like chatting with a real person.
 """),
     MessagesPlaceholder(variable_name="chat_history", optional=True),
@@ -424,22 +424,30 @@ You speak like a thoughtful friend — casual, clear, and kind — not like a fo
     )
 ])
 
-def get_rag_chain(tenant_id: int, user_id: str = "default"):
+def get_rag_chain(tenant_id: int, user_id: str = "default", initial_history: list = None):
     retriever = S3VectorRetriever(tenant_id=tenant_id)
     llm = ChatBedrock(model_id=LLM_MODEL, region_name=REGION_NAME, model_kwargs={"temperature": 0.3})
     memory = ConversationBufferMemory(return_messages=True, memory_key="chat_history")
+
+    # If an initial history (list of HumanMessage/AIMessage) is provided, pre-load it into memory
+    if initial_history:
+        try:
+            memory.chat_memory.messages = list(initial_history)
+        except Exception:
+            # Fallback: ignore if messages can't be set
+            pass
 
     qa_chain = create_stuff_documents_chain(llm, CONVERSATIONAL_RAG_PROMPT)
     rag_chain = create_retrieval_chain(retriever, qa_chain)
 
     def invoke(text: str):
         result = rag_chain.invoke({"input": text, "chat_history": memory.chat_memory.messages})
-        memory.save_context({"input": text}, {"output": result["answer"]})
+        memory.save_context({"input": text}, {"output": result.get("answer", "")})
         return result
 
     return invoke
 
-def answer_question_modern(question: str, tenant_id: int, user_id: str = "default"):
+def answer_question_modern(question: str, tenant_id: int, user_id: str = "default", context_messages: list = None):
     cleaned = question.strip().lower()
     if cleaned in FIXED_RESPONSES:
         fixed_resp = FIXED_RESPONSES[cleaned]
@@ -449,7 +457,7 @@ def answer_question_modern(question: str, tenant_id: int, user_id: str = "defaul
             answer = str(fixed_resp)
         return {"answer": answer.strip(), "sources": ["Fixed Response"]}
 
-    chain = get_rag_chain(tenant_id, user_id)
+    chain = get_rag_chain(tenant_id, user_id, initial_history=context_messages)
     result = chain(question)
     sources = list(set(d.metadata.get("source", "unknown") for d in result.get("context", [])))
     return {"answer": result["answer"], "sources": sources}
