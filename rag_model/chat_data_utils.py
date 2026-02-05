@@ -180,7 +180,7 @@ def append_conversation_message(tenant_id: int, user_id: str, sender: str, text:
         print(f"Error appending conversation history locally for tenant {tenant_id}, user {user_id}: {e}")
 
 
-def get_recent_conversation_context(tenant_id: int, user_id: str, last_n_questions: int = 5) -> list:
+def get_recent_conversation_context(tenant_id: int, user_id: str, last_n_questions: int = 10) -> list:
     """Return a list of LangChain messages covering the most recent `last_n_questions` user questions
     and the surrounding AI replies (so continuity is preserved). Loads from S3 or local fallback.
 

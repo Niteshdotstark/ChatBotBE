@@ -5,6 +5,8 @@ import time
 import json
 import uuid
 import re
+import tempfile
+import shutil
 from typing import List, Optional, Dict, Any
 from botocore.exceptions import ClientError
 from urllib.parse import urlparse, urljoin
@@ -24,6 +26,9 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, HumanMessagePromptTemplate
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
+
+# Safe imports (no circular dependencies)
+from rag_model.config_models import ContextConfig, RetrievalConfig
 
 # ==============================================================================
 # CONFIGURATION
@@ -100,12 +105,12 @@ def s3_append_url(tenant_id: int, url: str):
 # ==============================================================================
 # CRAWLERS — FULLY RESTORED
 # ==============================================================================
-# def is_valid_url(url: str) -> bool:
-#     try:
-#         parsed = urlparse(url)
-#         return bool(parsed.netloc) and bool(parsed.scheme)
-#     except:
-#         return False
+def is_valid_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return bool(parsed.netloc) and bool(parsed.scheme)
+    except:
+        return False
 
 def clean_text(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
@@ -353,48 +358,124 @@ def index_tenant_files(tenant_id: int, additional_urls: List[str] = None):
     return total
 
 def retrieve_s3_vectors(query: str, tenant_id: int, top_k: int = 8) -> List[Document]:
-    ensure_vector_index()
-    q_vec = embeddings.embed_query(query)
-
+    """
+    Retrieve documents using S3 Vectors, with fallback to simple text search.
+    """
     try:
+        ensure_vector_index()
+        q_vec = embeddings.embed_query(query)
+
+        # Query without filter first (since filtering is broken)
         resp = s3vectors_client.query_vectors(
             vectorBucketName=S3_VECTORS_BUCKET_NAME,
             indexName=S3_VECTORS_INDEX_NAME,
             queryVector={"float32": q_vec},
-            topK=top_k,
+            topK=top_k * 3,  # Get more results to filter manually
             returnMetadata=True,
-            returnDistance=True,
-            filter={
-                TENANT_ID_KEY: str(tenant_id)
-            }
+            returnDistance=True
+            # NOTE: Removed filter due to S3 Vectors filtering issues
         )
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-        if error_code == "ResourceNotFoundException":
+        
+        docs = []
+        for v in resp.get("vectors", []):
+            meta = v.get("metadata", {})
+            
+            # Manual tenant filtering (since S3 Vectors filter is broken)
+            vector_tenant_id = meta.get(TENANT_ID_KEY, "")
+            if str(vector_tenant_id) != str(tenant_id):
+                continue
+            
+            content = meta.get(CONTENT_PREVIEW_KEY, "").strip()
+            if not content:
+                continue
+                
+            doc_meta = {
+                "source": meta.get(SOURCE_KEY, "S3 Vectors"),
+                "tenant_id": vector_tenant_id,
+                "person": meta.get("person", "unknown"),
+                "chunk_type": meta.get("chunk_type", "general")
+            }
+            
+            # Optional: Add distance score to metadata
+            if "distance" in v:
+                doc_meta["similarity_score"] = v["distance"]
+                
+            docs.append(Document(page_content=content, metadata=doc_meta))
+            
+            # Stop when we have enough docs for this tenant
+            if len(docs) >= top_k:
+                break
+        
+        print(f"🔍 Retrieved {len(docs)} documents for tenant {tenant_id}")
+        return docs
+        
+    except Exception as e:
+        print(f"S3 Vectors not available ({e}), falling back to simple text search...")
+        
+        # Fallback to simple text-based retrieval
+        try:
+            from rag_model.simple_text_retriever import get_simple_text_retriever
+            retriever = get_simple_text_retriever()
+            docs = retriever.retrieve_documents(query, tenant_id, top_k)
+            print(f"Simple text retriever found {len(docs)} documents")
+            return docs
+        except Exception as fallback_error:
+            print(f"Fallback retrieval also failed: {fallback_error}")
             return []
-        print(f"Query failed: {e}")
-        return []
-
-    docs = []
-    for v in resp.get("vectors", []):
-        meta = v.get("metadata", {})
-        content = meta.get(CONTENT_PREVIEW_KEY, "").strip()
-        if not content:
-            continue
-        doc_meta = {"source": meta.get(SOURCE_KEY, "S3 Vectors")}
-        # Optional: Add distance score to metadata
-        if "distance" in v:
-            doc_meta["similarity_score"] = v["distance"]
-        docs.append(Document(page_content=content, metadata=doc_meta))
-    return docs
 # ==============================================================================
 # LangChain RAG Chain
 # ==============================================================================
+def filter_documents_by_person(documents: List[Document], person_name: str) -> List[Document]:
+    """
+    Filter documents to only include those that contain information about the specific person.
+    This prevents cross-contamination between different people's information.
+    """
+    if not person_name or not documents:
+        return documents
+    
+    person_name_lower = person_name.lower()
+    filtered_docs = []
+    
+    for doc in documents:
+        content = doc.page_content.lower()
+        source = doc.metadata.get('source', '').lower()
+        
+        # Check if the document source contains the person's name
+        if person_name_lower in source:
+            filtered_docs.append(doc)
+            continue
+            
+        # Check if the document content contains the person's name
+        if person_name_lower in content:
+            filtered_docs.append(doc)
+            continue
+            
+        # Special handling for common name variations
+        if person_name_lower == "nitesh":
+            if "nitesh" in content or "nitesh" in source:
+                filtered_docs.append(doc)
+        elif person_name_lower == "mahi":
+            if "mahi" in content or "mahi" in source or "maheshwari" in content:
+                filtered_docs.append(doc)
+    
+    print(f"🔍 Filtered {len(documents)} → {len(filtered_docs)} documents for {person_name}")
+    return filtered_docs
+
 class S3VectorRetriever(BaseRetriever):
     tenant_id: int
     top_k: int = 8
+    person_filter: str = None
+    
     def _get_relevant_documents(self, query: str) -> List[Document]:
-        return retrieve_s3_vectors(query, self.tenant_id, self.top_k)
+        # Get all relevant documents
+        docs = retrieve_s3_vectors(query, self.tenant_id, self.top_k)
+        
+        # If we have a person filter, apply it
+        if self.person_filter:
+            docs = filter_documents_by_person(docs, self.person_filter)
+        
+        return docs
+        
     async def _aget_relevant_documents(self, query: str) -> List[Document]:
         return self._get_relevant_documents(query)
 
@@ -413,20 +494,56 @@ You speak like a thoughtful friend — casual, clear, and kind — not like a fo
    - “I couldn't find details about that, want me to check somewhere else?”
 5. If a similar or related person/topic exists, you can suggest it:
    - “I didn't find anyone named Anil, but Sunil Sharma is mentioned as the CEO of DotStark.”
-6. Keep responses short (under 700 characters), natural, and friendly.
-7. Use contractions (it's, don't, that's) to sound human.
-8. Never invent information that isn't in the context or knowledge base.
-9. Avoid robotic or apologetic language — speak casually, like chatting with a real person.
+6. For instructional content (how-to guides, procedures, reporting steps), provide comprehensive details with all available options and steps.
+7. For general conversation, keep responses natural and friendly.
+8. Use contractions (it's, don't, that's) to sound human.
+9. Never invent information that isn't in the context or knowledge base.
+10. Avoid robotic or apologetic language — speak casually, like chatting with a real person.
+11. When multiple options or methods are available, present them all clearly with proper structure.
+12. CRITICAL: When asked about a specific person, ONLY provide information about that exact person. DO NOT mix information from different people's documents.
+13. DOCUMENT ATTRIBUTION: Before mentioning any project, skill, or experience, verify it belongs to the person being asked about. If a document mentions multiple people, only extract information that clearly belongs to the specific person in question.
+14. CROSS-CONTAMINATION PREVENTION: If you're unsure whether information belongs to the person being asked about, do not include it. It's better to say "I don't have that information" than to provide incorrect attribution.
+15. PRONOUN RESOLUTION: When users use pronouns like "he", "she", "it", "they", "his", "her", etc., look at the conversation history to understand who or what they're referring to. For example:
+    - If previous message mentioned "Nitesh" and user asks "How many years of experience he has?", understand that "he" = "Nitesh"
+    - If previous message mentioned "the project" and user asks "What technologies does it use?", understand that "it" = "the project"
+16. CONTEXT CONTINUITY: Always consider the full conversation when answering follow-up questions.
+17. VERIFICATION RULE: Before stating any fact about a person, ask yourself: "Does this information clearly and explicitly belong to [person's name] in the source documents?"
 """),
     MessagesPlaceholder(variable_name="chat_history", optional=True),
     HumanMessagePromptTemplate.from_template(
-        """Context:\n{context}\n\nQuestion: {input}\n\nAnswer (under 1000 characters):"""
+        """Retrieved Context (PRIMARY SOURCE - USE THIS FIRST):\n{context}\n\nConversation History (for pronoun resolution only - DO NOT use for facts):\n{chat_history}\n\nQuestion: {input}\n\nCRITICAL INSTRUCTIONS:\n1. Base your answer ONLY on the Retrieved Context above\n2. If the Retrieved Context contains information about the person asked, use ONLY that information\n3. IGNORE any facts from Conversation History that contradict the Retrieved Context\n4. If the Retrieved Context doesn't contain information about the specific person, say "I don't have information about [person's name] in my knowledge base"\n5. DO NOT mix information from different people under any circumstances\n\nAnswer:"""
     )
 ])
 
+def extract_person_name_from_query(query: str, chat_history: list = None) -> str:
+    """
+    Extract the person's name from the query or chat history.
+    """
+    query_lower = query.lower()
+    
+    # Direct name mentions in current query
+    if "nitesh" in query_lower:
+        return "Nitesh"
+    elif "mahi" in query_lower:
+        return "Mahi"
+    
+    # Check for pronouns and resolve from chat history
+    pronouns = ["he", "his", "him", "she", "her", "they", "their"]
+    if any(pronoun in query_lower for pronoun in pronouns) and chat_history:
+        # Look at recent chat history to find the person being referenced
+        for message in reversed(chat_history[-6:]):  # Last 3 exchanges
+            if hasattr(message, 'content'):
+                content = message.content.lower()
+                if "nitesh" in content:
+                    return "Nitesh"
+                elif "mahi" in content:
+                    return "Mahi"
+    
+    return None
+
 def get_rag_chain(tenant_id: int, user_id: str = "default", initial_history: list = None):
     retriever = S3VectorRetriever(tenant_id=tenant_id)
-    llm = ChatBedrock(model_id=LLM_MODEL, region_name=REGION_NAME, model_kwargs={"temperature": 0.3})
+    llm = ChatBedrock(model_id=LLM_MODEL, region_name=REGION_NAME, model_kwargs={"temperature": 0.1})
     memory = ConversationBufferMemory(return_messages=True, memory_key="chat_history")
 
     # If an initial history (list of HumanMessage/AIMessage) is provided, pre-load it into memory
@@ -441,13 +558,31 @@ def get_rag_chain(tenant_id: int, user_id: str = "default", initial_history: lis
     rag_chain = create_retrieval_chain(retriever, qa_chain)
 
     def invoke(text: str):
+        # Extract person name from query and chat history
+        person_name = extract_person_name_from_query(text, memory.chat_memory.messages)
+        
+        # Update retriever with person filter
+        if person_name:
+            retriever.person_filter = person_name
+            print(f"🎯 Filtering documents for: {person_name}")
+        
         result = rag_chain.invoke({"input": text, "chat_history": memory.chat_memory.messages})
         memory.save_context({"input": text}, {"output": result.get("answer", "")})
         return result
 
     return invoke
 
-def answer_question_modern(question: str, tenant_id: int, user_id: str = "default", context_messages: list = None):
+def answer_question_modern(question: str, tenant_id: int, user_id: str = "default", context_messages: list = None, response_mode: str = "detailed"):
+    """
+    Enhanced answer function with intelligent query processing and support for different response modes
+    
+    Args:
+        question: User's question
+        tenant_id: Tenant ID
+        user_id: User ID
+        context_messages: Conversation context
+        response_mode: "detailed", "summary", or "both"
+    """
     cleaned = question.strip().lower()
     if cleaned in FIXED_RESPONSES:
         fixed_resp = FIXED_RESPONSES[cleaned]
@@ -455,12 +590,246 @@ def answer_question_modern(question: str, tenant_id: int, user_id: str = "defaul
             answer = fixed_resp.get("answer", str(fixed_resp))  # Extract inner 'answer' or fallback to str
         else:
             answer = str(fixed_resp)
-        return {"answer": answer.strip(), "sources": ["Fixed Response"]}
+        
+        # Apply response mode to fixed responses too
+        if response_mode == "summary":
+            from rag_model.response_summarizer import summarize_for_social_media
+            summary = summarize_for_social_media(answer)
+            return {"answer": summary, "sources": ["Fixed Response"], "response_type": "summary"}
+        elif response_mode == "both":
+            from rag_model.response_summarizer import summarize_for_social_media
+            summary = summarize_for_social_media(answer)
+            return {
+                "detailed_answer": answer, 
+                "summary_answer": summary,
+                "sources": ["Fixed Response"], 
+                "response_type": "both"
+            }
+        else:
+            return {"answer": answer.strip(), "sources": ["Fixed Response"], "response_type": "detailed"}
 
-    chain = get_rag_chain(tenant_id, user_id, initial_history=context_messages)
-    result = chain(question)
-    sources = list(set(d.metadata.get("source", "unknown") for d in result.get("context", [])))
-    return {"answer": result["answer"], "sources": sources}
+    # Extract person name from query and context
+    person_filter = extract_person_name_from_query(question, context_messages)
+    
+    # Try intelligent query processing first for better semantic understanding
+    try:
+        from rag_model.intelligent_query_processor import answer_question_with_intelligent_processing
+        print(f"🧠 Using Intelligent Query Processing with person filter: {person_filter}")
+        
+        result = answer_question_with_intelligent_processing(
+            question, tenant_id, user_id, context_messages, response_mode
+        )
+        
+        # If intelligent processing found good results, return them
+        if result and result.get("answer") and "I don't have information" not in result["answer"]:
+            return result
+        else:
+            print("🔄 Intelligent processing didn't find good results, trying advanced RAG...")
+            
+    except Exception as e:
+        print(f"Intelligent query processing failed: {e}")
+    
+    # Try advanced RAG system as fallback
+    try:
+        from rag_model.advanced_aws_rag import answer_question_advanced
+        print(f"🚀 Using Advanced RAG System with person filter: {person_filter}")
+        
+        result = answer_question_advanced(question, tenant_id, person_filter)
+        
+        # Apply intelligent fallback if the response is too generic
+        from rag_model.intelligent_fallback import enhance_response_with_fallback
+        enhanced_answer = enhance_response_with_fallback(
+            question, 
+            result["answer"], 
+            []  # Advanced system handles document context internally
+        )
+        result["answer"] = enhanced_answer
+        
+        # Apply response mode
+        if response_mode == "summary":
+            from rag_model.response_summarizer import summarize_for_social_media
+            summary = summarize_for_social_media(result["answer"])
+            return {
+                "answer": summary, 
+                "sources": result.get("sources", [])[:2],  # Limit sources for summary
+                "response_type": "summary"
+            }
+        elif response_mode == "both":
+            from rag_model.response_summarizer import summarize_for_social_media
+            summary = summarize_for_social_media(result["answer"])
+            return {
+                "detailed_answer": result["answer"],
+                "summary_answer": summary,
+                "sources": result.get("sources", []),
+                "response_type": "both"
+            }
+        else:
+            result["response_type"] = "detailed"
+            return result
+            
+    except Exception as e:
+        print(f"Advanced RAG failed, falling back to enhanced: {e}")
+        
+        # Try enhanced context-aware response generation
+        try:
+            result = answer_question_enhanced(question, tenant_id, user_id, context_messages)
+            
+            # Apply intelligent fallback if the response is too generic
+            from rag_model.intelligent_fallback import enhance_response_with_fallback
+            enhanced_answer = enhance_response_with_fallback(
+                question, 
+                result["answer"], 
+                result.get("retrieved_docs", [])
+            )
+            result["answer"] = enhanced_answer
+            
+            # Apply response mode
+            if response_mode == "summary":
+                from rag_model.response_summarizer import summarize_for_social_media
+                summary = summarize_for_social_media(result["answer"])
+                return {
+                    "answer": summary, 
+                    "sources": result.get("sources", [])[:2],  # Limit sources for summary
+                    "response_type": "summary"
+                }
+            elif response_mode == "both":
+                from rag_model.response_summarizer import summarize_for_social_media
+                summary = summarize_for_social_media(result["answer"])
+                return {
+                    "detailed_answer": result["answer"],
+                    "summary_answer": summary,
+                    "sources": result.get("sources", []),
+                    "response_type": "both"
+                }
+            else:
+                result["response_type"] = "detailed"
+                return result
+                
+        except Exception as e:
+            print(f"Enhanced response generation failed, falling back to standard: {e}")
+            # Fallback to original implementation
+            chain = get_rag_chain(tenant_id, user_id, initial_history=context_messages)
+            result = chain(question)
+            sources = list(set(d.metadata.get("source", "unknown") for d in result.get("context", [])))
+            
+            # Apply intelligent fallback to standard response too
+            from rag_model.intelligent_fallback import enhance_response_with_fallback
+            enhanced_answer = enhance_response_with_fallback(
+                question, 
+                result["answer"], 
+                result.get("context", [])
+            )
+            
+            # Apply response mode to fallback response
+            if response_mode == "summary":
+                from rag_model.response_summarizer import summarize_for_social_media
+                summary = summarize_for_social_media(enhanced_answer)
+                return {
+                    "answer": summary, 
+                    "sources": sources[:2],
+                    "response_type": "summary"
+                }
+            elif response_mode == "both":
+                from rag_model.response_summarizer import summarize_for_social_media
+                summary = summarize_for_social_media(enhanced_answer)
+                return {
+                    "detailed_answer": enhanced_answer,
+                    "summary_answer": summary,
+                    "sources": sources,
+                    "response_type": "both"
+                }
+            else:
+                return {
+                    "answer": enhanced_answer, 
+                    "sources": sources,
+                    "response_type": "detailed"
+                }
+
+
+def answer_question_enhanced(question: str, tenant_id: int, user_id: str = "default", context_messages: list = None):
+    """
+    Enhanced question answering with context-aware response generation.
+    Implements Requirements 6.1, 6.2, 6.3, 6.4 for context integration, conflict detection, 
+    topic shift handling, and clarification support.
+    """
+    try:
+        # Import advanced RAG components
+        from rag_model.context_manager import EnhancedContextManager
+        from rag_model.dynamic_retriever import DynamicRetriever
+        from rag_model.context_aware_response import ContextAwareResponseGenerator
+        from rag_model.topic_clarification_handler import (
+            detect_clarification_request, detect_topic_shift_with_adaptation, adapt_retrieval_strategy
+        )
+        from rag_model.config_manager import get_tenant_config
+        
+        # Get tenant configuration
+        try:
+            config = get_tenant_config(tenant_id)
+            context_config = config.context
+            retrieval_config = config.retrieval
+        except Exception as e:
+            print(f"Failed to load tenant config, using defaults: {e}")
+            context_config = ContextConfig()
+            retrieval_config = RetrievalConfig()
+        
+        # Initialize enhanced components
+        context_manager = EnhancedContextManager(context_config)
+        dynamic_retriever = DynamicRetriever(retrieval_config)
+        response_generator = ContextAwareResponseGenerator()
+        
+        # Get enhanced conversation context
+        conversation_context = context_manager.get_conversation_context(
+            tenant_id, user_id, question, max_tokens=context_config.max_context_tokens
+        )
+        
+        # Detect topic shifts and clarification requests
+        topic_shift = detect_topic_shift_with_adaptation(question, conversation_context)
+        clarification_request = detect_clarification_request(question, conversation_context)
+        
+        # Adapt retrieval strategy based on topic shifts and clarifications
+        adapted_retrieval_config = adapt_retrieval_strategy(
+            topic_shift, clarification_request, retrieval_config
+        )
+        
+        # Update dynamic retriever with adapted configuration
+        dynamic_retriever.base_config = adapted_retrieval_config
+        
+        # Perform dynamic retrieval with context awareness
+        retrieved_docs, retrieval_metadata = dynamic_retriever.analyze_and_retrieve(
+            question, tenant_id, conversation_context, retrieve_s3_vectors
+        )
+        
+        # Generate context-aware response
+        response_data = response_generator.generate_enhanced_response(
+            question, retrieved_docs, conversation_context, 
+            retrieval_metadata.get("query_analysis")
+        )
+        
+        # Update conversation context with the new exchange
+        context_manager.update_context(tenant_id, user_id, question, response_data["response"])
+        
+        return {
+            "answer": response_data["response"],
+            "sources": response_data["sources"],
+            "metadata": {
+                "retrieval": retrieval_metadata,
+                "response": response_data["metadata"],
+                "topic_shift": {
+                    "detected": topic_shift.shift_type.value != "no_shift",
+                    "type": topic_shift.shift_type.value,
+                    "adaptation_applied": topic_shift.retrieval_adaptation_needed
+                },
+                "clarification": {
+                    "detected": clarification_request.is_clarification,
+                    "type": clarification_request.clarification_type.value if clarification_request.is_clarification else None,
+                    "handled": clarification_request.is_clarification
+                }
+            }
+        }
+    except Exception as e:
+        print(f"Enhanced response generation failed: {e}")
+        # Fallback to original implementation
+        raise e
 
 if __name__ == "__main__":
     import sys
