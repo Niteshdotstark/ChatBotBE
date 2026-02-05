@@ -8,9 +8,17 @@ from sqlalchemy.orm import Session
 from database import get_db, engine, Base
 from models import User, Tenant, KnowledgeBaseFile, TenantValues
 from rag_model.rag_utils import index_tenant_files, s3_client, S3_BUCKET_NAME, S3_PREFIX_KNOWLEDGE, s3_append_url, index_tenant_files, s3_list_tenant_files, trigger_reindexing
+from rag_model.config_manager import get_config_manager, get_tenant_config, update_tenant_config
+from rag_model.config_models import RAGSystemConfig, DEFAULT_CONFIGS
+from rag_model.config_schemas import (
+    RAGConfigSchema, ConfigUpdateRequest, ConfigResetRequest, ConfigResponse,
+    ConfigValidationResponse, TenantConfigListResponse, ConfigPresetListResponse
+)
 from schemas import (
     UserCreate, UserResponse, TenantCreate, TenantBase,TenantUpdate, ActivityLogResponse,
-    KnowledgeBaseFileResponse, DatabaseCreate, DatabaseResponse, TokenResponse, ChatRequest, ChatResponse, TenantValuesUpdate, TopQuestionAnalysis, ConversationCountResponse, TenantResponse
+    KnowledgeBaseFileResponse, DatabaseCreate, DatabaseResponse, TokenResponse, 
+    ChatRequest, ChatResponse, DualChatResponse, TenantValuesUpdate, TopQuestionAnalysis, 
+    ConversationCountResponse, TenantResponse
 )
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -381,15 +389,19 @@ async def get_latest_analysis_report_data(
         print(f"Error loading or parsing report file {latest_report_path}: {e}")
         raise HTTPException(status_code=500, detail="Failed to load analysis report data.")
 
-@app.post("/rag/ask/{tenant_id}", response_model=ChatResponse)
+@app.post("/rag/ask/{tenant_id}")
 async def ask_rag_with_path_tenant_id(
     tenant_id: int, # <--- Taken directly from the URL path
-    request: ChatRequest, # <--- The body only needs the message
+    request: ChatRequest, # <--- The body includes message and optional response_mode
     db: Session = Depends(get_db)
 ):
     """
-    A public-facing endpoint to get RAG answers using the tenant_id in the URL path.
-    The request body only requires the 'message'.
+    Public-facing RAG endpoint - returns SUMMARY responses by default (for social media platforms)
+    
+    Response modes:
+    - "detailed": Full comprehensive response (for admin/direct API calls when explicitly requested)
+    - "summary": Concise summary with 1000 character limit (default, for social media platforms)
+    - "both": Returns both detailed and summary responses
     """
     # Optional: Basic check to ensure the tenant exists (good practice)
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
@@ -399,18 +411,44 @@ async def ask_rag_with_path_tenant_id(
     try:
         user_key = "api_anonymous"
         append_conversation_message(tenant_id, user_key, 'human', request.message)
-        context_msgs = get_recent_conversation_context(tenant_id, user_key, last_n_questions=5)
+        context_msgs = get_recent_conversation_context(tenant_id, user_key, last_n_questions=10)
 
-        response_data = answer_question_modern(request.message, tenant_id, user_key, context_messages=context_msgs)
-        answer_text = response_data.get("answer", "No answer found.")
-
-        # Save AI reply to history
-        append_conversation_message(tenant_id, user_key, 'ai', answer_text)
-
-        return ChatResponse(
-            response=answer_text,
-            sources=response_data.get("sources", [])
+        # Default to summary mode for social media platforms, allow override via request
+        response_mode = getattr(request, 'response_mode', 'summary')
+        
+        response_data = answer_question_modern(
+            request.message, 
+            tenant_id, 
+            user_key, 
+            context_messages=context_msgs,
+            response_mode=response_mode
         )
+
+        # Handle different response types
+        if response_data.get("response_type") == "both":
+            # Save detailed response to history
+            append_conversation_message(tenant_id, user_key, 'ai', response_data.get("detailed_answer", ""))
+            
+            return DualChatResponse(
+                detailed_response=response_data.get("detailed_answer"),
+                summary_response=response_data.get("summary_answer"),
+                sources=[],  # Remove sources from response
+                response_type="both",
+                summary_metadata=response_data.get("summary_metadata")
+            )
+        else:
+            # Single response (detailed or summary)
+            answer_text = response_data.get("answer", "No answer found.")
+            
+            # Save AI reply to history
+            append_conversation_message(tenant_id, user_key, 'ai', answer_text)
+
+            return ChatResponse(
+                response=answer_text,
+                sources=[],  # Remove sources from response
+                response_type=response_data.get("response_type", "summary")
+            )
+            
     except Exception as e:
         # Handle potential errors from the RAG model
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred: {str(e)}")
@@ -848,6 +886,9 @@ async def chat_with_tenant_kb(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """
+    Admin/authenticated user chat endpoint - always returns detailed responses
+    """
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
     if not tenant or tenant.creator_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to access this tenant's knowledge base")
@@ -856,9 +897,16 @@ async def chat_with_tenant_kb(
     try:
         user_key = str(current_user.id)
         append_conversation_message(tenant_id, user_key, 'human', chat_request.message)
-        context_msgs = get_recent_conversation_context(tenant_id, user_key, last_n_questions=5)
+        context_msgs = get_recent_conversation_context(tenant_id, user_key, last_n_questions=10)
 
-        response_data = answer_question_modern(chat_request.message, tenant_id, user_key, context_messages=context_msgs)
+        # Admin users always get detailed responses
+        response_data = answer_question_modern(
+            chat_request.message, 
+            tenant_id, 
+            user_key, 
+            context_messages=context_msgs,
+            response_mode="detailed"
+        )
         answer_text = response_data.get("answer", "No answer found.")
 
         append_conversation_message(tenant_id, user_key, 'ai', answer_text)
@@ -866,7 +914,8 @@ async def chat_with_tenant_kb(
         # Ensure the response_data has 'answer' and 'sources' keys
         return ChatResponse(
             response=answer_text,
-            sources=response_data.get("sources", [])
+            sources=[],  # Remove sources from response
+            response_type="detailed"
         )
     except Exception as e:
         # Handle potential errors from the RAG model
@@ -879,12 +928,22 @@ async def ask_chatbot(
     # api_key: str = Depends(get_api_key),
     db: Session = Depends(get_db)
 ):
-    # This returns {"answer": "...", "sources": [...]}
+    """
+    Direct API chatbot endpoint - returns DETAILED responses without limitations (for admin/direct API calls)
+    """
     user_key = "api_anonymous"
     append_conversation_message(tenant_id, user_key, 'human', request.message)
-    context_msgs = get_recent_conversation_context(tenant_id, user_key, last_n_questions=5)
+    context_msgs = get_recent_conversation_context(tenant_id, user_key, last_n_questions=10)
 
-    response_data = answer_question_modern(request.message, tenant_id, user_key, context_messages=context_msgs)
+    # Direct API calls always get detailed responses without limitations
+    response_data = answer_question_modern(
+        request.message, 
+        tenant_id, 
+        user_key, 
+        context_messages=context_msgs,
+        response_mode="detailed"
+    )
+    
     print(f"DEBUG: Type of response_data: {type(response_data)}")
     print(f"DEBUG: Content of response_data: {response_data}")
     
@@ -900,10 +959,10 @@ async def ask_chatbot(
 
     append_conversation_message(tenant_id, user_key, 'ai', final_answer_string)
 
-    # ----------------------------------------------------------------------
-
     return ChatResponse(
-        response=final_answer_string
+        response=final_answer_string,
+        sources=[],  # Remove sources from response
+        response_type="detailed"
     )
 
 @app.get("/webhook/{tenant_id}")
@@ -993,11 +1052,17 @@ async def handle_webhook(tenant_id: int, request: Request, db: Session = Depends
                         # Save incoming human message
                         append_conversation_message(TENANT_ID, str(sender_id), 'human', text)
 
-                        # Load recent context (last 5 human questions + surrounding AI replies)
-                        context_msgs = get_recent_conversation_context(TENANT_ID, str(sender_id), last_n_questions=5)
+                        # Load recent context (last 10 human questions + surrounding AI replies)
+                        context_msgs = get_recent_conversation_context(TENANT_ID, str(sender_id), last_n_questions=10)
 
-                        # Pass TENANT_ID and context to RAG model
-                        response_data = answer_question_modern(text, TENANT_ID, str(sender_id), context_messages=context_msgs)
+                        # Pass TENANT_ID and context to RAG model with SUMMARY mode for social media
+                        response_data = answer_question_modern(
+                            text, 
+                            TENANT_ID, 
+                            str(sender_id), 
+                            context_messages=context_msgs,
+                            response_mode="summary"  # Force summary mode for social media platforms
+                        )
 
                         # SAFELY extract the answer string, no matter what
                         if isinstance(response_data, dict):
@@ -1064,9 +1129,15 @@ async def telegram_webhook(
         try:
             # Save incoming message
             append_conversation_message(tenant_id, str(chat_id), 'human', text)
-            context_msgs = get_recent_conversation_context(tenant_id, str(chat_id), last_n_questions=5)
+            context_msgs = get_recent_conversation_context(tenant_id, str(chat_id), last_n_questions=10)
 
-            response_data = answer_question_modern(text, tenant_id, str(chat_id), context_messages=context_msgs)
+            response_data = answer_question_modern(
+                text, 
+                tenant_id, 
+                str(chat_id), 
+                context_messages=context_msgs,
+                response_mode="summary"  # Force summary mode for Telegram
+            )
             response_text = response_data.get("answer", "No answer found.")
             response_text = format_response(response_text)
 
@@ -1194,3 +1265,274 @@ async def send_reply(recipient_id: str, reply_text: str, access_token: str, plat
             else:
                 print(f"✅ {platform.capitalize()} reply {i}/{len(messages)} sent")
             await asyncio.sleep(1)
+
+
+# ==============================================================================
+# RAG CONFIGURATION ENDPOINTS
+# ==============================================================================
+
+@app.get("/tenants/{tenant_id}/config/", response_model=ConfigResponse)
+async def get_tenant_config_endpoint(
+    tenant_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get RAG configuration for a specific tenant"""
+    # Verify tenant ownership
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant or tenant.creator_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this tenant's configuration")
+    
+    try:
+        config = get_tenant_config(tenant_id)
+        config_schema = RAGConfigSchema(
+            chunking=config.chunking.__dict__,
+            retrieval=config.retrieval.__dict__,
+            context=config.context.__dict__,
+            quality=config.quality.__dict__,
+            tenant_id=config.tenant_id
+        )
+        
+        # Validate configuration
+        warnings = config.validate_compatibility()
+        validation = ConfigValidationResponse(
+            valid=True,
+            warnings=warnings,
+            errors=[]
+        )
+        
+        return ConfigResponse(
+            success=True,
+            message=f"Configuration retrieved for tenant {tenant_id}",
+            config=config_schema,
+            validation=validation
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving configuration: {str(e)}")
+
+
+@app.put("/tenants/{tenant_id}/config/", response_model=ConfigResponse)
+async def update_tenant_config_endpoint(
+    tenant_id: int,
+    config_data: RAGConfigSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Update RAG configuration for a specific tenant"""
+    # Verify tenant ownership
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant or tenant.creator_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this tenant's configuration")
+    
+    try:
+        # Convert schema to config model
+        config_dict = config_data.dict()
+        config_dict['tenant_id'] = tenant_id
+        config = RAGSystemConfig.from_dict(config_dict)
+        
+        # Update configuration
+        success = update_tenant_config(tenant_id, config)
+        
+        if success:
+            # Validate configuration
+            warnings = config.validate_compatibility()
+            validation = ConfigValidationResponse(
+                valid=True,
+                warnings=warnings,
+                errors=[]
+            )
+            
+            return ConfigResponse(
+                success=True,
+                message=f"Configuration updated for tenant {tenant_id}",
+                config=config_data,
+                validation=validation
+            )
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update configuration")
+            
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid configuration: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating configuration: {str(e)}")
+
+
+@app.patch("/tenants/{tenant_id}/config/", response_model=ConfigResponse)
+async def partial_update_tenant_config(
+    tenant_id: int,
+    update_request: ConfigUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Partially update RAG configuration for a specific tenant"""
+    # Verify tenant ownership
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant or tenant.creator_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this tenant's configuration")
+    
+    try:
+        config_manager = get_config_manager()
+        success = config_manager.update_config_partial(tenant_id, update_request.updates)
+        
+        if success:
+            # Get updated configuration
+            updated_config = get_tenant_config(tenant_id)
+            config_schema = RAGConfigSchema(
+                chunking=updated_config.chunking.__dict__,
+                retrieval=updated_config.retrieval.__dict__,
+                context=updated_config.context.__dict__,
+                quality=updated_config.quality.__dict__,
+                tenant_id=updated_config.tenant_id
+            )
+            
+            # Validate configuration
+            warnings = updated_config.validate_compatibility()
+            validation = ConfigValidationResponse(
+                valid=True,
+                warnings=warnings,
+                errors=[]
+            )
+            
+            return ConfigResponse(
+                success=True,
+                message=f"Configuration partially updated for tenant {tenant_id}",
+                config=config_schema,
+                validation=validation
+            )
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update configuration")
+            
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid configuration update: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating configuration: {str(e)}")
+
+
+@app.post("/tenants/{tenant_id}/config/reset/", response_model=ConfigResponse)
+async def reset_tenant_config(
+    tenant_id: int,
+    reset_request: ConfigResetRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Reset tenant configuration to a default preset"""
+    # Verify tenant ownership
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant or tenant.creator_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this tenant's configuration")
+    
+    try:
+        config_manager = get_config_manager()
+        success = config_manager.reset_to_default(tenant_id, reset_request.preset.value)
+        
+        if success:
+            # Get reset configuration
+            reset_config = get_tenant_config(tenant_id)
+            config_schema = RAGConfigSchema(
+                chunking=reset_config.chunking.__dict__,
+                retrieval=reset_config.retrieval.__dict__,
+                context=reset_config.context.__dict__,
+                quality=reset_config.quality.__dict__,
+                tenant_id=reset_config.tenant_id
+            )
+            
+            return ConfigResponse(
+                success=True,
+                message=f"Configuration reset to '{reset_request.preset.value}' preset for tenant {tenant_id}",
+                config=config_schema,
+                validation=ConfigValidationResponse(valid=True, warnings=[], errors=[])
+            )
+        else:
+            raise HTTPException(status_code=500, detail="Failed to reset configuration")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error resetting configuration: {str(e)}")
+
+
+@app.post("/tenants/{tenant_id}/config/invalidate-cache/")
+async def invalidate_tenant_config_cache(
+    tenant_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Invalidate configuration cache for a tenant (force reload from storage)"""
+    # Verify tenant ownership
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant or tenant.creator_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to manage this tenant's configuration")
+    
+    try:
+        config_manager = get_config_manager()
+        config_manager.invalidate_cache(tenant_id)
+        
+        return {"success": True, "message": f"Configuration cache invalidated for tenant {tenant_id}"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error invalidating cache: {str(e)}")
+
+
+@app.get("/config/presets/", response_model=ConfigPresetListResponse)
+async def get_config_presets():
+    """Get available configuration presets"""
+    try:
+        presets = {}
+        descriptions = {
+            "balanced": "Balanced configuration suitable for most use cases",
+            "high_precision": "High precision configuration with strict similarity thresholds",
+            "high_recall": "High recall configuration for comprehensive document retrieval",
+            "fast_response": "Fast response configuration optimized for speed"
+        }
+        
+        for preset_name, preset_config in DEFAULT_CONFIGS.items():
+            presets[preset_name] = RAGConfigSchema(
+                chunking=preset_config.chunking.__dict__,
+                retrieval=preset_config.retrieval.__dict__,
+                context=preset_config.context.__dict__,
+                quality=preset_config.quality.__dict__,
+                tenant_id=None
+            )
+        
+        return ConfigPresetListResponse(
+            presets=presets,
+            descriptions=descriptions
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving presets: {str(e)}")
+
+
+@app.get("/admin/config/tenants/", response_model=TenantConfigListResponse)
+async def list_all_tenant_configs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """List configurations for all tenants owned by the current user"""
+    try:
+        # Get all tenants owned by the current user
+        user_tenants = db.query(Tenant).filter(Tenant.creator_id == current_user.id).all()
+        tenant_ids = [tenant.id for tenant in user_tenants]
+        
+        config_manager = get_config_manager()
+        tenant_configs = {}
+        
+        for tenant_id in tenant_ids:
+            try:
+                config = get_tenant_config(tenant_id)
+                tenant_configs[tenant_id] = RAGConfigSchema(
+                    chunking=config.chunking.__dict__,
+                    retrieval=config.retrieval.__dict__,
+                    context=config.context.__dict__,
+                    quality=config.quality.__dict__,
+                    tenant_id=config.tenant_id
+                )
+            except Exception as e:
+                print(f"⚠️ Error loading config for tenant {tenant_id}: {e}")
+                continue
+        
+        return TenantConfigListResponse(
+            tenant_configs=tenant_configs,
+            total_count=len(tenant_configs)
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing tenant configurations: {str(e)}")

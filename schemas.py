@@ -120,10 +120,19 @@ class DatabaseResponse(DatabaseBase):
 
 class ChatRequest(BaseModel):
     message: str
+    response_mode: Optional[str] = Field(default="detailed", description="Response mode: 'detailed', 'summary', or 'both'")
 
 class ChatResponse(BaseModel):
     response: str
     sources: List[str] = Field(default_factory=list)
+    response_type: Optional[str] = Field(default="detailed", description="Type of response: 'detailed', 'summary', or 'both'")
+
+class DualChatResponse(BaseModel):
+    detailed_response: Optional[str] = None
+    summary_response: Optional[str] = None
+    sources: List[str] = Field(default_factory=list)
+    response_type: str = Field(description="Type of response: 'detailed', 'summary', or 'both'")
+    summary_metadata: Optional[dict] = None
 
 class TenantValuesUpdate(BaseModel):
     tenant_id: int
