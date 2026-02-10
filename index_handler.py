@@ -17,7 +17,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # ==============================================================================
 S3_VECTORS_REGION = "ap-south-1"
 S3_VECTORS_BUCKET_NAME = os.getenv("S3_VECTORS_BUCKET_NAME", "rag-vectordb-bucket")
-S3_VECTORS_INDEX_NAME = os.getenv("S3_VECTORS_INDEX_NAME", "tenant-knowledge-index")
+# NOTE: We now use separate indexes per tenant for proper isolation
+# S3_VECTORS_INDEX_NAME is deprecated - use get_tenant_index_name(tenant_id) instead
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "rag-chat-uploads")
 S3_PREFIX_KNOWLEDGE = "knowledge_base"
 EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
@@ -40,26 +41,37 @@ print("✅ Clients initialized")
 # HELPER FUNCTIONS
 # ==============================================================================
 
-def ensure_vector_index():
-    """Create vector index if it doesn't exist"""
+def get_tenant_index_name(tenant_id: int) -> str:
+    """
+    Get the dedicated index name for a specific tenant.
+    AWS Best Practice: Use separate vector index per tenant for data isolation.
+    Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-best-practices.html
+    """
+    return f"tenant-{tenant_id}-index"
+
+
+def ensure_vector_index(tenant_id: int):
+    """Create tenant-specific vector index if it doesn't exist"""
+    index_name = get_tenant_index_name(tenant_id)
+    
     try:
         s3vectors_client.put_vectors(
             vectorBucketName=S3_VECTORS_BUCKET_NAME,
-            indexName=S3_VECTORS_INDEX_NAME,
-            vectors=[{"key": "ping", "data": {"float32": [0.0] * 1024}, "metadata": {"tenant_id": "0"}}]
+            indexName=index_name,
+            vectors=[{"key": "ping", "data": {"float32": [0.0] * 1024}, "metadata": {"tenant_id": str(tenant_id)}}]
         )
         s3vectors_client.delete_vectors(
             vectorBucketName=S3_VECTORS_BUCKET_NAME,
-            indexName=S3_VECTORS_INDEX_NAME,
+            indexName=index_name,
             keys=["ping"]
         )
-        print(f"✅ Index '{S3_VECTORS_INDEX_NAME}' exists")
+        print(f"✅ Tenant {tenant_id} isolated index '{index_name}' exists")
         return
     except Exception as e:
         if 'NotFoundException' not in str(e) and 'ValidationException' not in str(e):
             raise
     
-    print(f"📝 Creating index '{S3_VECTORS_INDEX_NAME}'...")
+    print(f"📦 Creating ISOLATED index for tenant {tenant_id}: '{index_name}'...")
     try:
         try:
             s3vectors_client.create_vector_bucket(vectorBucketName=S3_VECTORS_BUCKET_NAME)
@@ -67,16 +79,16 @@ def ensure_vector_index():
             pass
         s3vectors_client.create_index(
             vectorBucketName=S3_VECTORS_BUCKET_NAME,
-            indexName=S3_VECTORS_INDEX_NAME,
+            indexName=index_name,
             dataType="float32",
             dimension=1024,
             distanceMetric="cosine",
             metadataConfiguration={"nonFilterableMetadataKeys": ["internal_id"]}
         )
-        print("✅ Index created")
+        print(f"✅ ISOLATED INDEX CREATED: {index_name} (tenant {tenant_id} data only)")
     except Exception as e:
         if 'ConflictException' in str(e):
-            print("✅ Index already exists")
+            print(f"✅ Index {index_name} already exists")
         else:
             raise
 
@@ -135,10 +147,11 @@ class MultiTenantProcessor:
 
 
 def upload_to_vector_db(processed_chunks: List[dict], tenant_id: int, source: str):
-    """Upload chunks to vector database"""
+    """Upload chunks to tenant's ISOLATED vector database index"""
     if not processed_chunks:
         return
     
+    index_name = get_tenant_index_name(tenant_id)
     batch_size = 50
     total_uploaded = 0
     
@@ -171,19 +184,22 @@ def upload_to_vector_db(processed_chunks: List[dict], tenant_id: int, source: st
         
         s3vectors_client.put_vectors(
             vectorBucketName=S3_VECTORS_BUCKET_NAME,
-            indexName=S3_VECTORS_INDEX_NAME,
+            indexName=index_name,  # ← ISOLATED index per tenant
             vectors=payload
         )
         total_uploaded += len(payload)
-        print(f"📤 Uploaded batch {i//batch_size + 1}: {len(payload)} vectors")
+        print(f"📤 Uploaded batch {i//batch_size + 1}: {len(payload)} vectors to {index_name}")
     
-    print(f"✅ Total uploaded: {total_uploaded} vectors")
+    print(f"✅ Total uploaded: {total_uploaded} vectors to ISOLATED index: {index_name}")
 
 
 def index_tenant_files(tenant_id: int):
-    """Main indexing function"""
+    """Main indexing function - creates ISOLATED index per tenant"""
+    index_name = get_tenant_index_name(tenant_id)
+    
     print(f"\n{'='*70}")
-    print(f"🚀 Starting indexing for tenant {tenant_id}")
+    print(f"🔒 ISOLATED INDEXING FOR TENANT {tenant_id}")
+    print(f"📦 Using dedicated index: {index_name}")
     print(f"{'='*70}\n")
     
     processor = MultiTenantProcessor()
@@ -191,7 +207,7 @@ def index_tenant_files(tenant_id: int):
     total_chunks_created = 0
     
     try:
-        ensure_vector_index()
+        ensure_vector_index(tenant_id)
         # Skipping delete - S3 Vectors filtering limitations
         # New vectors will be added alongside existing ones
         files = s3_list_tenant_files(tenant_id)
@@ -255,15 +271,17 @@ def index_tenant_files(tenant_id: int):
                     os.remove(local_file_path)
         
         print(f"\n{'='*70}")
-        print(f"✅ INDEXING COMPLETE")
-        print(f"   Tenant: {tenant_id}")
-        print(f"   Files: {len(files)}")
-        print(f"   Chunks: {total_chunks_created}")
+        print(f"✅ ISOLATED INDEXING COMPLETE")
+        print(f"Tenant: {tenant_id}")
+        print(f"Index: {index_name}")
+        print(f"Files: {len(files)}")
+        print(f"Chunks: {total_chunks_created}")
         print(f"{'='*70}\n")
         
         return {
             "status": "success",
             "tenant_id": tenant_id,
+            "index_name": index_name,
             "files_processed": len(files),
             "total_chunks_added": total_chunks_created
         }
