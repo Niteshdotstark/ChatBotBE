@@ -680,7 +680,7 @@ async def create_knowledge_base_item(
     db.commit()
     db.refresh(kb_file)
 
-    # NO INDEXING CALL HERE - IT'S DECOUPLED!
+    # Trigger Lambda indexing via SQS
     trigger_reindexing(tenant_id)
     return kb_file
 
@@ -712,8 +712,10 @@ async def add_url_to_file_and_db(
     db.commit()
     db.refresh(kb_file)
 
+    # Trigger Lambda indexing via SQS
     trigger_reindexing(tenant_id)
-    # NO INDEXING CALL HERE - IT'S DECOUPLED!
+    
+    return kb_fileLL HERE - IT'S DECOUPLED!
 
     return kb_file
 
@@ -795,6 +797,7 @@ async def update_knowledge_base_item(
     except IOError as e:
         print(f"Failed to rebuild url.txt: {e}")
 
+    # Trigger Lambda indexing via SQS
     trigger_reindexing(tenant_id)
     
     db.refresh(item)
@@ -857,7 +860,7 @@ async def delete_knowledge_base_item(
         except IOError as e:
             print(f"Failed to rebuild url.txt after delete: {e}")
 
-    # 6. Trigger a background task to re-index the tenant's files
+    # 6. Trigger Lambda indexing via SQS
     trigger_reindexing(tenant_id)
 
     # Return 204 No Content, which is standard for a successful DELETE

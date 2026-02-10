@@ -357,9 +357,10 @@ def index_tenant_files(tenant_id: int, additional_urls: List[str] = None):
     print(f"INDEXING COMPLETE: {total} vectors added for tenant {tenant_id}\n")
     return total
 
-def retrieve_s3_vectors(query: str, tenant_id: int, top_k: int = 8) -> List[Document]:
+def retrieve_s3_vectors(query: str, tenant_id: int, top_k: int = 12) -> List[Document]:
     """
     Retrieve documents using S3 Vectors, with fallback to simple text search.
+    Increased top_k from 8 to 12 for better coverage of policy documents.
     """
     try:
         ensure_vector_index()
@@ -370,7 +371,7 @@ def retrieve_s3_vectors(query: str, tenant_id: int, top_k: int = 8) -> List[Docu
             vectorBucketName=S3_VECTORS_BUCKET_NAME,
             indexName=S3_VECTORS_INDEX_NAME,
             queryVector={"float32": q_vec},
-            topK=top_k * 3,  # Get more results to filter manually
+            topK=top_k * 5,  # Increased multiplier to get more results for filtering
             returnMetadata=True,
             returnDistance=True
             # NOTE: Removed filter due to S3 Vectors filtering issues
