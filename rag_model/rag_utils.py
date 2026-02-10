@@ -371,7 +371,7 @@ def retrieve_s3_vectors(query: str, tenant_id: int, top_k: int = 12) -> List[Doc
             vectorBucketName=S3_VECTORS_BUCKET_NAME,
             indexName=S3_VECTORS_INDEX_NAME,
             queryVector={"float32": q_vec},
-            topK=top_k * 5,  # Increased multiplier to get more results for filtering
+            topK=top_k * 15,  # Increased to 15x to handle multi-tenant scenarios
             returnMetadata=True,
             returnDistance=True
             # NOTE: Removed filter due to S3 Vectors filtering issues
