@@ -19,5 +19,11 @@
   },
   "bye": {
     "answer": "Goodbye! Have a great day and come back anytime."
+  },
+  "how can we report the question and to whom": {
+    "answer": "For reporting questions or issues, here are the typical approaches:\n\n**Option 1: Direct Reporting (Recommended)**\n- Look for a 'Report Content Errors' or 'Report Issue' button while viewing the question\n- Select the type of issue (incorrect answer, unclear wording, typo, etc.)\n- Provide a clear, detailed description of the problem\n- Submit the report\n\n**Option 2: Contact Support**\n- If direct reporting isn't available, contact the official support team\n- Include specific details about the question and the issue\n- Mention the course or exam prep material name\n\n**General Tips:**\n- Always provide clear descriptions of issues\n- Include question details when possible\n- Don't include personal information in reports\n- Use official channels for fastest resolution"
+  },
+  "how to report question": {
+    "answer": "For reporting questions or issues, here are the typical approaches:\n\n**Option 1: Direct Reporting (Recommended)**\n- Look for a 'Report Content Errors' or 'Report Issue' button while viewing the question\n- Select the type of issue (incorrect answer, unclear wording, typo, etc.)\n- Provide a clear, detailed description of the problem\n- Submit the report\n\n**Option 2: Contact Support**\n- If direct reporting isn't available, contact the official support team\n- Include specific details about the question and the issue\n- Mention the course or exam prep material name\n\n**General Tips:**\n- Always provide clear descriptions of issues\n- Include question details when possible\n- Don't include personal information in reports\n- Use official channels for fastest resolution"
   }
 }
